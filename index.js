@@ -97,7 +97,8 @@ app.get('/api/spots', async (req, res) => {
     const viewStateGeneratorMatch = topHtml.match(/name="__VIEWSTATEGENERATOR"[^>]*value="([^"]+)"/);
 
     if (!viewStateMatch) {
-      throw new Error('Could not extract __VIEWSTATE');
+     throw new Error('Could not extract __VIEWSTATE. HTML length: ' + topHtml.length + ', Sample: ' + topHtml.substring(0, 500));
+    }
     }
 
     // Step 2: POSTリクエストで最新100を選択

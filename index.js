@@ -3,17 +3,15 @@ const net = require('net');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// CORS設定
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   next();
 });
 
-// スポットデータを保存
 let cachedSpots = [];
 let lastUpdate = null;
+let connectionStatus = 'disconnected';
 
-// 周波数からバンドを判定
 function freqToBand(freqKhz) {
   if (freqKhz >= 1800 && freqKhz <= 1913) return '1.9MHz';
   if (freqKhz >= 3500 && freqKhz <= 3687) return '3.5MHz';
@@ -31,9 +29,8 @@ function freqToBand(freqKhz) {
   return 'Other';
 }
 
-// DXスポット行をパース
-// 形式: DX de JA1XXX:  7074.0  JA2YYY       FT8                 1234Z
 function parseSpotLine(line) {
+  // 形式: DX de JA1XXX:  7074.0  JA2YYY  FT8  1234Z
   const match = line.match(/DX de\s+([A-Z0-9/]+):\s+(\d+\.?\d*)\s+([A-Z0-9/]+)\s+(.*?)\s+(\d{4})Z/i);
   if (!match) return null;
   
@@ -46,7 +43,6 @@ function parseSpotLine(line) {
   const freqKhz = parseFloat(freqStr);
   const band = freqToBand(freqKhz);
   
-  // コメントからモードを推測
   let mode = '';
   if (/FT8/i.test(comment)) mode = 'FT8';
   else if (/FT4/i.test(comment)) mode = 'FT4';
@@ -57,130 +53,91 @@ function parseSpotLine(line) {
   else if (/AM/i.test(comment)) mode = 'AM';
   
   return {
-    spotter,
-    dx,
-    frequency: freqStr,
-    band,
-    mode,
-    comment,
-    time,
+    spotter, dx, frequency: freqStr, band, mode, comment, time,
     date: new Date().toISOString().split('T')[0],
-    qth: '',
-    qthName: '',
-    entity: 'Japan',
-    flag: '',
-    source: 'j-cluster',
+    qth: '', qthName: '', entity: 'Japan', flag: '', source: 'j-cluster',
   };
 }
 
-// Telnetで接続してスポットを取得
-function fetchSpotsViaTelnet() {
-  return new Promise((resolve, reject) => {
-    const spots = [];
-    let buffer = '';
-    let loginSent = false;
+function connectTelnet() {
+  const client = new net.Socket();
+  let buffer = '';
+  let loginSent = false;
+  
+  connectionStatus = 'connecting';
+  console.log('Connecting to J-Cluster Telnet...');
+  
+  client.connect(7300, 'dxc.j-cluster.com', () => {
+    console.log('Connected to dxc.j-cluster.com:7300');
+    connectionStatus = 'connected';
+  });
+  
+  client.on('data', (data) => {
+    buffer += data.toString();
     
-    const client = new net.Socket();
-    client.setTimeout(30000);
-    
-    // J-Cluster Telnetサーバー
-    client.connect(7373, 'jcluster.net', () => {
-      console.log('Connected to J-Cluster');
-    });
-    
-    client.on('data', (data) => {
-      buffer += data.toString();
-      
-      // ログインプロンプトが来たらコールサインを送信
-      if (!loginSent && (buffer.includes('login:') || buffer.includes('Please enter your call') || buffer.includes('callsign'))) {
-        client.write('JA1ZLO\r\n'); // 一般的なクラブ局コールサイン
+    // ログインプロンプトが来たらコールサインを送信
+    if (!loginSent && (buffer.includes('login:') || buffer.includes('call') || buffer.includes('>') || buffer.length > 50)) {
+      setTimeout(() => {
+        client.write('JA1ZLO\r\n');
         loginSent = true;
-        console.log('Login sent');
-      }
-      
-      // スポット行をパース
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || ''; // 最後の不完全な行を保持
-      
-      for (const line of lines) {
-        if (line.includes('DX de')) {
-          const spot = parseSpotLine(line);
-          if (spot) {
-            spots.push(spot);
-          }
+        console.log('Sent callsign: JA1ZLO');
+      }, 500);
+    }
+    
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    
+    for (const line of lines) {
+      if (line.includes('DX de')) {
+        const spot = parseSpotLine(line);
+        if (spot) {
+          cachedSpots.unshift(spot);
+          if (cachedSpots.length > 200) cachedSpots.pop();
+          lastUpdate = new Date().toISOString();
         }
       }
-      
-      // 十分なスポットが集まったら切断
-      if (spots.length >= 100) {
-        client.destroy();
-        resolve(spots);
-      }
-    });
-    
-    client.on('timeout', () => {
-      console.log('Telnet timeout, got', spots.length, 'spots');
-      client.destroy();
-      resolve(spots);
-    });
-    
-    client.on('error', (err) => {
-      console.error('Telnet error:', err.message);
-      client.destroy();
-      reject(err);
-    });
-    
-    client.on('close', () => {
-      console.log('Connection closed, got', spots.length, 'spots');
-      resolve(spots);
-    });
-    
-    // 15秒後に強制切断
-    setTimeout(() => {
-      if (spots.length > 0) {
-        client.destroy();
-        resolve(spots);
-      }
-    }, 15000);
-  });
-}
-
-// 定期的にスポットを更新（5分ごと）
-async function updateSpots() {
-  try {
-    console.log('Fetching spots via Telnet...');
-    const spots = await fetchSpotsViaTelnet();
-    if (spots.length > 0) {
-      cachedSpots = spots;
-      lastUpdate = new Date().toISOString();
-      console.log('Updated cache with', spots.length, 'spots');
     }
-  } catch (err) {
-    console.error('Failed to update spots:', err.message);
-  }
+  });
+  
+  client.on('error', (err) => {
+    console.error('Telnet error:', err.message);
+    connectionStatus = 'error: ' + err.message;
+  });
+  
+  client.on('close', () => {
+    console.log('Connection closed, reconnecting in 10s...');
+    connectionStatus = 'disconnected';
+    setTimeout(connectTelnet, 10000);
+  });
+  
+  client.on('timeout', () => {
+    console.log('Connection timeout');
+    client.destroy();
+  });
+  
+  client.setTimeout(60000);
 }
 
-// 起動時とその後5分ごとに更新
-updateSpots();
-setInterval(updateSpots, 5 * 60 * 1000);
+// 起動時に接続
+connectTelnet();
 
-// API
 app.get('/api/spots', (req, res) => {
   const limit = parseInt(req.query.limit) || 100;
   res.json({
     spots: cachedSpots.slice(0, limit),
     count: cachedSpots.length,
     source: 'J-Cluster (Telnet)',
+    connectionStatus,
     lastUpdate,
     timestamp: new Date().toISOString(),
   });
 });
 
-// ヘルスチェック
 app.get('/', (req, res) => {
   res.json({ 
     status: 'ok', 
     service: 'J-Cluster Proxy (Telnet)',
+    connectionStatus,
     spotsCount: cachedSpots.length,
     lastUpdate,
   });

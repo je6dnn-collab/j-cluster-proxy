@@ -11,6 +11,14 @@ app.use((req, res, next) => {
 let cachedSpots = [];
 let lastUpdate = null;
 let connectionStatus = 'disconnected';
+let debugLog = [];
+
+function log(msg) {
+  const timestamp = new Date().toISOString();
+  console.log(`[${timestamp}] ${msg}`);
+  debugLog.unshift(`[${timestamp}] ${msg}`);
+  if (debugLog.length > 50) debugLog.pop();
+}
 
 function freqToBand(freqKhz) {
   if (freqKhz >= 1800 && freqKhz <= 1913) return '1.9MHz';
@@ -30,7 +38,6 @@ function freqToBand(freqKhz) {
 }
 
 function parseSpotLine(line) {
-  // 形式: DX de JA1XXX:  7074.0  JA2YYY  FT8  1234Z
   const match = line.match(/DX de\s+([A-Z0-9/]+):\s+(\d+\.?\d*)\s+([A-Z0-9/]+)\s+(.*?)\s+(\d{4})Z/i);
   if (!match) return null;
   
@@ -63,27 +70,38 @@ function connectTelnet() {
   const client = new net.Socket();
   let buffer = '';
   let loginSent = false;
+  let loggedIn = false;
   
   connectionStatus = 'connecting';
-  console.log('Connecting to J-Cluster Telnet...');
+  log('Connecting to dxc.j-cluster.com:7300...');
   
   client.connect(7300, 'dxc.j-cluster.com', () => {
-    console.log('Connected to dxc.j-cluster.com:7300');
-    connectionStatus = 'connected';
+    log('TCP connected, waiting for login prompt...');
+    connectionStatus = 'connected, waiting for login:';
   });
   
   client.on('data', (data) => {
-    buffer += data.toString();
+    const text = data.toString();
+    buffer += text;
     
-    // ログインプロンプトが来たらコールサインを送信
-    if (!loginSent && (buffer.includes('login:') || buffer.includes('call') || buffer.includes('>') || buffer.length > 50)) {
-      setTimeout(() => {
-        client.write('JA1ZLO\r\n');
-        loginSent = true;
-        console.log('Sent callsign: JA1ZLO');
-      }, 500);
+    log('Received: ' + text.substring(0, 100).replace(/\n/g, '\\n'));
+    
+    // login: プロンプトを待ってからコールサインを送信
+    if (!loginSent && buffer.toLowerCase().includes('login:')) {
+      log('Got login prompt, sending callsign...');
+      client.write('JE6DNN\r\n');
+      loginSent = true;
+      connectionStatus = 'login sent, waiting for welcome...';
     }
     
+    // ログイン成功確認
+    if (loginSent && !loggedIn && buffer.includes('de J-CLUSTER')) {
+      log('Login successful!');
+      loggedIn = true;
+      connectionStatus = 'logged in, receiving spots';
+    }
+    
+    // スポット行をパース
     const lines = buffer.split('\n');
     buffer = lines.pop() || '';
     
@@ -94,31 +112,31 @@ function connectTelnet() {
           cachedSpots.unshift(spot);
           if (cachedSpots.length > 200) cachedSpots.pop();
           lastUpdate = new Date().toISOString();
+          log('New spot: ' + spot.dx + ' on ' + spot.frequency);
         }
       }
     }
   });
   
   client.on('error', (err) => {
-    console.error('Telnet error:', err.message);
+    log('Error: ' + err.message);
     connectionStatus = 'error: ' + err.message;
   });
   
   client.on('close', () => {
-    console.log('Connection closed, reconnecting in 10s...');
-    connectionStatus = 'disconnected';
+    log('Connection closed, reconnecting in 10s...');
+    connectionStatus = 'disconnected, reconnecting...';
     setTimeout(connectTelnet, 10000);
   });
   
   client.on('timeout', () => {
-    console.log('Connection timeout');
+    log('Timeout');
     client.destroy();
   });
   
-  client.setTimeout(60000);
+  client.setTimeout(120000);
 }
 
-// 起動時に接続
 connectTelnet();
 
 app.get('/api/spots', (req, res) => {
@@ -133,6 +151,10 @@ app.get('/api/spots', (req, res) => {
   });
 });
 
+app.get('/debug', (req, res) => {
+  res.json({ connectionStatus, spotsCount: cachedSpots.length, lastUpdate, debugLog });
+});
+
 app.get('/', (req, res) => {
   res.json({ 
     status: 'ok', 
@@ -144,5 +166,5 @@ app.get('/', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`J-Cluster Proxy running on port ${PORT}`);
+  log(`Server running on port ${PORT}`);
 });

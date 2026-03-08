@@ -52,4 +52,56 @@ function parseSpotLine(line) {
   
   let mode = '';
   if (/FT8/i.test(comment)) mode = 'FT8';
-  else if (/FT4/i
+  else if (/FT4/i.test(comment)) mode = 'FT4';
+  else if (/CW/i.test(comment)) mode = 'CW';
+  else if (/SSB|USB|LSB/i.test(comment)) mode = 'SSB';
+  else if (/RTTY/i.test(comment)) mode = 'RTTY';
+  else if (/FM/i.test(comment)) mode = 'FM';
+  else if (/AM/i.test(comment)) mode = 'AM';
+  
+  return {
+    spotter, dx, frequency: freqStr, band, mode, comment, time,
+    date: new Date().toISOString().split('T')[0],
+    qth: '', qthName: '', entity: 'Japan', flag: '', source: 'j-cluster',
+  };
+}
+
+function connectTelnet() {
+  const client = new net.Socket();
+  let buffer = '';
+  let loginSent = false;
+  let loggedIn = false;
+  
+  connectionStatus = 'connecting';
+  log('Connecting to 49.212.158.156:7300...');
+  
+  client.connect(7300, '49.212.158.156', () => {
+    log('TCP connected, waiting for login prompt...');
+    connectionStatus = 'connected, waiting for login:';
+  });
+  
+  client.on('data', (data) => {
+    const text = data.toString();
+    buffer += text;
+    
+    log('Received: ' + text.substring(0, 100).replace(/\n/g, '\\n'));
+    
+    if (!loginSent && buffer.toLowerCase().includes('login:')) {
+      log('Got login prompt, sending callsign...');
+      client.write('JE6DNN\r\n');
+      loginSent = true;
+      connectionStatus = 'login sent, waiting for welcome...';
+    }
+    
+    if (loginSent && !loggedIn && buffer.includes('de J-CLUSTER')) {
+      log('Login successful!');
+      loggedIn = true;
+      connectionStatus = 'logged in, receiving spots';
+    }
+    
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    
+    for (const line of lines) {
+      if (line.includes('DX de')) {
+        const spot = parseSpotLine(line);

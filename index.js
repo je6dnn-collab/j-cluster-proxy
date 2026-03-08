@@ -105,3 +105,63 @@ function connectTelnet() {
     for (const line of lines) {
       if (line.includes('DX de')) {
         const spot = parseSpotLine(line);
+        if (spot) {
+          cachedSpots.unshift(spot);
+          if (cachedSpots.length > 200) cachedSpots.pop();
+          lastUpdate = new Date().toISOString();
+          log('New spot: ' + spot.dx + ' on ' + spot.frequency);
+        }
+      }
+    }
+  });
+  
+  client.on('error', (err) => {
+    log('Error: ' + err.message);
+    connectionStatus = 'error: ' + err.message;
+  });
+  
+  client.on('close', () => {
+    log('Connection closed, reconnecting in 10s...');
+    connectionStatus = 'disconnected, reconnecting...';
+    setTimeout(connectTelnet, 10000);
+  });
+  
+  client.on('timeout', () => {
+    log('Timeout');
+    client.destroy();
+  });
+  
+  client.setTimeout(120000);
+}
+
+connectTelnet();
+
+app.get('/api/spots', (req, res) => {
+  const limit = parseInt(req.query.limit) || 100;
+  res.json({
+    spots: cachedSpots.slice(0, limit),
+    count: cachedSpots.length,
+    source: 'J-Cluster (Telnet)',
+    connectionStatus,
+    lastUpdate,
+    timestamp: new Date().toISOString(),
+  });
+});
+
+app.get('/debug', (req, res) => {
+  res.json({ connectionStatus, spotsCount: cachedSpots.length, lastUpdate, debugLog });
+});
+
+app.get('/', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    service: 'J-Cluster Proxy (Telnet)',
+    connectionStatus,
+    spotsCount: cachedSpots.length,
+    lastUpdate,
+  });
+});
+
+app.listen(PORT, () => {
+  log(`Server running on port ${PORT}`);
+});

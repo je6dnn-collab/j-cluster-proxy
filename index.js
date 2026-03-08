@@ -1,13 +1,17 @@
 const express = require('express');
+const net = require('net');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
 // CORS設定
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
   next();
 });
+
+// スポットデータを保存
+let cachedSpots = [];
+let lastUpdate = null;
 
 // 周波数からバンドを判定
 function freqToBand(freqKhz) {
@@ -27,122 +31,159 @@ function freqToBand(freqKhz) {
   return 'Other';
 }
 
-// HTMLからスポットをパース
-function parseQrvHtml(html) {
-  const spots = [];
-  const rowRegex = /<LineStart><!--(\d+)--><\/LineStart>(.*?)<LineEnd><!--\1--><\/LineEnd>/g;
-  let match;
-
-  while ((match = rowRegex.exec(html)) !== null) {
-    const rowHtml = match[2];
-    try {
-      const dateMatch = rowHtml.match(/<Date>([^<]+)<\/Date>/i);
-      const timeMatch = rowHtml.match(/<Time>([^<]+)<\/Time>/i);
-      const freqMatch = rowHtml.match(/<Freq>([^<]+)<\/Freq>/i);
-      const modeMatch = rowHtml.match(/<Mode>([^<]+)<\/Mode>/i);
-      const qthMatch = rowHtml.match(/<Qth>([^<]*)<\/Qth>/i);
-      const qthNameMatch = rowHtml.match(/<QthName>([^<]*)<\/QthName>/i);
-      const commentsMatch = rowHtml.match(/<Comments>([^<]*)<\/Comments>/i);
-      const callToMatch = rowHtml.match(/<CallSignTo><a[^>]*>\s*([^<]+)<\/a><\/CallSignTo>/i);
-      const callFromMatch = rowHtml.match(/<CallSignFrom><a[^>]*>\s*([^<]+)<\/a><\/CallSignFrom>/i);
-
-      if (callToMatch && freqMatch) {
-        const dx = callToMatch[1].trim();
-        const freqStr = freqMatch[1].replace(/,/g, '').trim();
-        const freqKhz = parseFloat(freqStr);
-        const band = freqToBand(freqKhz);
-
-        spots.push({
-          spotter: callFromMatch ? callFromMatch[1].trim() : '',
-          dx: dx,
-          frequency: freqStr,
-          band: band,
-          mode: modeMatch ? modeMatch[1].trim() : '',
-          comment: commentsMatch ? commentsMatch[1].trim() : '',
-          time: timeMatch ? timeMatch[1].trim() : '',
-          date: dateMatch ? dateMatch[1].trim() : '',
-          qth: qthMatch ? qthMatch[1].trim() : '',
-          qthName: qthNameMatch ? qthNameMatch[1].trim() : '',
-          entity: 'Japan',
-          flag: '',
-          source: 'j-cluster',
-        });
-      }
-    } catch (e) {
-      // パースエラーは無視
-    }
-  }
-  return spots;
+// DXスポット行をパース
+// 形式: DX de JA1XXX:  7074.0  JA2YYY       FT8                 1234Z
+function parseSpotLine(line) {
+  const match = line.match(/DX de\s+([A-Z0-9/]+):\s+(\d+\.?\d*)\s+([A-Z0-9/]+)\s+(.*?)\s+(\d{4})Z/i);
+  if (!match) return null;
+  
+  const spotter = match[1].trim();
+  const freqStr = match[2].trim();
+  const dx = match[3].trim();
+  const comment = match[4].trim();
+  const time = match[5].substring(0,2) + ':' + match[5].substring(2,4);
+  
+  const freqKhz = parseFloat(freqStr);
+  const band = freqToBand(freqKhz);
+  
+  // コメントからモードを推測
+  let mode = '';
+  if (/FT8/i.test(comment)) mode = 'FT8';
+  else if (/FT4/i.test(comment)) mode = 'FT4';
+  else if (/CW/i.test(comment)) mode = 'CW';
+  else if (/SSB|USB|LSB/i.test(comment)) mode = 'SSB';
+  else if (/RTTY/i.test(comment)) mode = 'RTTY';
+  else if (/FM/i.test(comment)) mode = 'FM';
+  else if (/AM/i.test(comment)) mode = 'AM';
+  
+  return {
+    spotter,
+    dx,
+    frequency: freqStr,
+    band,
+    mode,
+    comment,
+    time,
+    date: new Date().toISOString().split('T')[0],
+    qth: '',
+    qthName: '',
+    entity: 'Japan',
+    flag: '',
+    source: 'j-cluster',
+  };
 }
 
-// メインAPI
-app.get('/api/spots', async (req, res) => {
-  const limit = parseInt(req.query.limit) || 100;
+// Telnetで接続してスポットを取得
+function fetchSpotsViaTelnet() {
+  return new Promise((resolve, reject) => {
+    const spots = [];
+    let buffer = '';
+    let loginSent = false;
+    
+    const client = new net.Socket();
+    client.setTimeout(30000);
+    
+    // J-Cluster Telnetサーバー
+    client.connect(7373, 'jcluster.net', () => {
+      console.log('Connected to J-Cluster');
+    });
+    
+    client.on('data', (data) => {
+      buffer += data.toString();
+      
+      // ログインプロンプトが来たらコールサインを送信
+      if (!loginSent && (buffer.includes('login:') || buffer.includes('Please enter your call') || buffer.includes('callsign'))) {
+        client.write('JA1ZLO\r\n'); // 一般的なクラブ局コールサイン
+        loginSent = true;
+        console.log('Login sent');
+      }
+      
+      // スポット行をパース
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || ''; // 最後の不完全な行を保持
+      
+      for (const line of lines) {
+        if (line.includes('DX de')) {
+          const spot = parseSpotLine(line);
+          if (spot) {
+            spots.push(spot);
+          }
+        }
+      }
+      
+      // 十分なスポットが集まったら切断
+      if (spots.length >= 100) {
+        client.destroy();
+        resolve(spots);
+      }
+    });
+    
+    client.on('timeout', () => {
+      console.log('Telnet timeout, got', spots.length, 'spots');
+      client.destroy();
+      resolve(spots);
+    });
+    
+    client.on('error', (err) => {
+      console.error('Telnet error:', err.message);
+      client.destroy();
+      reject(err);
+    });
+    
+    client.on('close', () => {
+      console.log('Connection closed, got', spots.length, 'spots');
+      resolve(spots);
+    });
+    
+    // 15秒後に強制切断
+    setTimeout(() => {
+      if (spots.length > 0) {
+        client.destroy();
+        resolve(spots);
+      }
+    }, 15000);
+  });
+}
 
+// 定期的にスポットを更新（5分ごと）
+async function updateSpots() {
   try {
-    const headers = {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'ja,en;q=0.9',
-    };
-
-    // Step 1: トップページにアクセスしてViewStateとCookieを取得
-    const topRes = await fetch('https://qrv.jp/', { headers });
-    const topHtml = await topRes.text();
-    const cookies = topRes.headers.get('set-cookie') || '';
-    const sessionCookie = cookies.split(';')[0];
-
-    const viewStateMatch = topHtml.match(/name="__VIEWSTATE"[^>]*value="([^"]+)"/);
-    const eventValidationMatch = topHtml.match(/name="__EVENTVALIDATION"[^>]*value="([^"]+)"/);
-    const viewStateGeneratorMatch = topHtml.match(/name="__VIEWSTATEGENERATOR"[^>]*value="([^"]+)"/);
-
-    if (!viewStateMatch) {
-     throw new Error('Could not extract __VIEWSTATE. HTML length: ' + topHtml.length + ', Sample: ' + topHtml.substring(0, 500));
+    console.log('Fetching spots via Telnet...');
+    const spots = await fetchSpotsViaTelnet();
+    if (spots.length > 0) {
+      cachedSpots = spots;
+      lastUpdate = new Date().toISOString();
+      console.log('Updated cache with', spots.length, 'spots');
     }
-    }
-
-    // Step 2: POSTリクエストで最新100を選択
-    const formData = new URLSearchParams();
-    formData.append('__EVENTTARGET', 'ctl12');
-    formData.append('__EVENTARGUMENT', '');
-    formData.append('__VIEWSTATE', viewStateMatch[1]);
-    formData.append('__VIEWSTATEGENERATOR', viewStateGeneratorMatch ? viewStateGeneratorMatch[1] : '');
-    formData.append('__EVENTVALIDATION', eventValidationMatch ? eventValidationMatch[1] : '');
-
-    const dataRes = await fetch('https://qrv.jp/', {
-      method: 'POST',
-      headers: {
-        ...headers,
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Cookie': sessionCookie,
-        'Referer': 'https://qrv.jp/',
-      },
-      body: formData.toString(),
-    });
-
-    const html = await dataRes.text();
-    const spots = parseQrvHtml(html);
-
-    res.json({
-      spots: spots.slice(0, limit),
-      count: spots.length,
-      source: 'J-Cluster (qrv.jp)',
-      timestamp: new Date().toISOString(),
-    });
-
-  } catch (error) {
-    res.status(500).json({
-      spots: [],
-      count: 0,
-      error: error.message,
-      timestamp: new Date().toISOString(),
-    });
+  } catch (err) {
+    console.error('Failed to update spots:', err.message);
   }
+}
+
+// 起動時とその後5分ごとに更新
+updateSpots();
+setInterval(updateSpots, 5 * 60 * 1000);
+
+// API
+app.get('/api/spots', (req, res) => {
+  const limit = parseInt(req.query.limit) || 100;
+  res.json({
+    spots: cachedSpots.slice(0, limit),
+    count: cachedSpots.length,
+    source: 'J-Cluster (Telnet)',
+    lastUpdate,
+    timestamp: new Date().toISOString(),
+  });
 });
 
 // ヘルスチェック
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', service: 'J-Cluster Proxy' });
+  res.json({ 
+    status: 'ok', 
+    service: 'J-Cluster Proxy (Telnet)',
+    spotsCount: cachedSpots.length,
+    lastUpdate,
+  });
 });
 
 app.listen(PORT, () => {
